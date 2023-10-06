@@ -1,0 +1,369 @@
+---
+title: "Fight Fraud"
+author: "Eldar Mammadli"
+output:
+  word_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## Introduction
+
+This document will describe installation, configuration and usage of the one technological solution for Big Data analysis. This solution is aim to be used by data scientists to analyse the data using R Studio Server, Apache Spark to take advantage of cluster computing and Streaming API. As a use-case of this technological combination we are going to create model using ML algorithms that will predict Fraud from stream of transactions in financial institutions.
+
+
+## Content
+
+### Target
+Predict Fraud transaction in financial institutions before it occurs with ML.
+
+### Input
+For creating and testing ML model we will use CSV file (creditcard.csv, ~144MB) having more than 284K transactions with 30 predictors and 1 outcome(Fraud, Not-fraud). 
+Downloaded from https://www.kaggle.com/mlg-ulb/creditcardfraud/home . Data is highly unbalanced with 284807 Not-fraud and only 492 Fraud transactions. Predictors numeric V1:V28 are the principal components obtained with PCA due to confidentiality, Time and Amount are untransformed predictors. Outcome is Class attribute with 1 for Fraud and 0 Not-fraud.
+For input for Apache Streaming API we will also use CSV files with same format, saved to source directory in working directory.
+
+### Technology
+
+  * Virtual Server Cent OS (7.4) - Virtual machine where R Studio Server and R Studio Server are installed
+    + R Studio Server (1.1.463) - IDE for R
+    + R (3.5.1)
+        -  sparklyr (0.9.3) - R interface for Apache Spark 
+        -  dplyr (0.7.8) - R data manipulation package
+    + Apache Spark 2.3.1 - Big Data processing engine
+        - Spark ML 
+        - Spark Streaming API
+![Technology used (https://spark.rstudio.com/examples/yarn-cluster-emr/)](/home/centos/final_project/images/emrArchitecture.png)
+
+
+### Output
+  * ML models for fraud prediction
+  * Output from Apache Streaming API after applying ML model in CSV format saved to source-out directory in working directory
+  
+### Steps
+
+  * Install R Studio Server (sparklyr, R)
+  * (preinstalled) Install Apache Spark (please follow lecture notes for installation)
+  * Connect R Studio to Spark, undestand the data, prepare data for analysis
+  * Visualize data using histogram, pairs plot
+  * Apply PCA on data, to identify the most significant components and relationship between data
+  * Split data to train and test and apply logistic regression and support vector machine classifiers to train data, plot test results
+  * Apply the model to Spark Streaming API
+
+
+## Code
+
+### Install R Studio Server (sparklyr, R)
+
+```
+##Run on VM Terminal
+#Install required libraries
+sudo yum install libcurl-devel openssl-devel
+
+#Download R Studio server
+wget https://download2.rstudio.org/rstudio-server-rhel-1.1.463-x86_64.rpm
+
+#Install R Studio server
+sudo yum install rstudio-server-rhel-1.1.463-x86_64.rpm
+
+#Install EPEL repository to be aple to install R
+sudo yum install epel-release
+
+#Install R
+sudo yum install R
+
+#Verify installation
+sudo rstudio-server verify-installation
+
+#This package is also required for R 'sparklyr' package
+sudo yum install libxml2-devel
+```
+Now it needs to be accesible on `http://<your_vm_ip_address>:8787` . Login with your VM system user (in my case login/pass: centos/****). Now we can switch to R Studio Console
+
+![R Studio](/home/centos/final_project/images/rstudio_screen.png)
+
+```
+##Run in R Studio Console
+#Install "sparklyr", "dplyr" packages
+install.packages("sparklyr")
+install.packages("dplyr")
+```
+
+#### Load libraries
+
+From now on we will work on final_project.Rmd file only
+
+```{r, libLoad}
+library(sparklyr)
+library(dplyr)
+library(scales)
+
+#library(future)
+#library(e1071)
+#library(DBI)
+
+wd_path = '/home/centos/final_project/'
+#setwd(wd_path)
+```
+
+### Connect R Studio to Spark, undestand the data, prepare data for analysis
+
+####Connect
+
+```{r, sparkConnect}
+#Set system envirement variable for SPARK_HOME
+Sys.setenv(SPARK_HOME='/opt/spark')
+
+#Get spark config
+conf = spark_config()
+
+#Connect spark. *If you installed Spark and R Studio Server in different VMs use instead of "local" "<ip_of_vm_with_spark>"
+sc = spark_connect(master = "local", config = conf)
+```
+
+#### Load data from csv file
+
+As you will see below the in R is a little bit different than in "usual". This is because we want to execute data manipulations and analyses on Spark using sparklyr package, not in R Studio itself. We want to take advantage of parallel processing. (More about R sparklyr package here: https://spark.rstudio.com)
+
+```{r, dataLoad}
+#Load creditcard.csv file to Spark DataFrame credit_raw
+#credit_raw = spark_read_csv(sc, name = "creditcard", path = "data/creditcard.csv", memory = FALSE)
+credit_raw = spark_read_csv(sc, name = "creditcard", path = "data/sample_creditcard.csv", memory = FALSE)
+
+#Print schema of Spark DataFrame, commented because of too long out output
+#sdf_schema(credit_raw)
+
+#Split data to Fraud and Not-Fraud dataframes
+credit0_raw = credit_raw %>% filter(Class == 0)
+credit1_raw = credit_raw %>% filter(Class == 1)
+
+#Print number of rows and columns in dataframes
+sdf_dim(credit_raw)
+sdf_dim(credit0_raw)
+sdf_dim(credit1_raw)
+
+#As we can see the data is highly unbalanced, there are much more Not-Fraud transaction than Fraud transactions. To transform data to more balanced format and for simplicity we are going to randomly take 10% of Not-Fraud transactions and merge them with all Fraud transactions
+#credit0_sample = sdf_sample(credit0_raw, fraction = 0.1)
+credit0_sample = sdf_sample(credit0_raw, fraction = 1)
+
+#Merge transactions to smaller dataset
+credit_sample = dplyr::union_all(credit0_sample, credit1_raw)
+
+#We will skip 'Time' is concequanctial predictor which is not relevant for data 
+credit = credit_sample %>% select(V1:V28, Amount, Class)
+
+#Print number of rows and columns in dataframe
+sdf_dim(credit)
+
+#credit = credit_sample %>% select(V1:V28, Amount, Class) %>% mutate(Class == 0, 2, 1)
+#spark_write_csv(credit, paste0(wd_path, "sample_creditcard.csv"), header = TRUE, delimiter = ",")
+
+#Convert/Pool Spark Dataframe to R dataframe. We will need it plotting data in R Studio
+credit_df = credit %>% collect
+
+write.csv(credit_df, file='/home/centos/final_project/data/sample_creditcard.csv')
+
+#Ordered credit_df, to overlay Fraud on top of Not-Fraud 'dots' when plotting since data is still highly unbalanced
+credit_ordered = credit_df[order(credit_df$Class, decreasing=F),]
+```
+
+## Visualize data using histogram, pairs plot
+
+### Histogram
+
+```{r, histAtt}
+#Show histograms for first 15 predictors
+hist.par = par(mar=c(2,2,2,2),mfrow=c(3,5),ps=10)
+for(coln in colnames(credit_df[,c(1:15)])) {
+    hist(credit_df[[coln]], main = coln, col=3)
+}
+par(hist.par)
+#Show histograms for next 15 predictors
+hist.par = par(mar=c(2,2,2,2),mfrow=c(3,5),ps=10)
+for(coln in colnames(credit_df[,c(16:30)])) {
+    hist(credit_df[[coln]], main = coln, col=3)
+}
+par(hist.par)
+```
+
+We can see that data mostly normaly distributed.
+
+
+### Pair plots
+
+```{r, pairAtt}
+#Show first 10 pairs of predictors inrelevance to outcome (red: Fraud, black:Not-Fraud)
+pairs(credit_ordered[,c(1:10)],  col=alpha(credit_ordered$Class+1, 0.5), cex=0.5-credit_ordered$Class/4, pch = credit_ordered$Class)
+
+#Show first 20 pairs of predictors inrelevance to outcome (red: Fraud, black:Not-Fraud)
+pairs(credit_ordered[,c(11:20)], col=alpha(credit_ordered$Class+1, 0.5), cex=0.5-credit_ordered$Class/4, pch = credit_ordered$Class)
+
+#Show first 30 pairs of predictors inrelevance to outcome (red: Fraud, black:Not-Fraud)
+pairs(credit_ordered[,c(21:29)], col=alpha(credit_ordered$Class+1, 0.5), cex=0.5-credit_ordered$Class/4, pch = credit_ordered$Class)
+
+```
+
+We can see from plots above that the data is seperable. It looks like there could be a good model to predicting Fraud.
+
+
+### Apply PCA on data, to identify the most significant components and relationship between data
+
+```{r, pca}
+#Create PCA formula
+pca_formula = as.formula(paste0("~0+",paste0( setdiff(colnames(credit_ordered),c("Class")), collapse = "+")))
+
+#Transform data for prcomp
+credit_pca = as.data.frame(model.matrix(pca_formula,data=credit_ordered))
+
+#Run PCA
+pca = prcomp(credit_pca,scale=T)
+
+#Summary of PCA, describing how much variance in data components describe
+summary(pca)
+
+#Print first 3 most important predictors
+pc1 = pca$rotation[,"PC1"]; pc1[which.max(abs(pc1))]
+pc2 = pca$rotation[,"PC2"]; pc2[which.max(abs(pc2))]
+pc3 = pca$rotation[,"PC3"]; pc3[which.max(abs(pc3))]
+
+#Get PC1 and PC2
+pca_pc12 = pca$x[,1:2]
+
+#Plot biplot of components
+plot(pca_pc12, main="Class (green NotFrau,  red Fraud)",
+     xlim=c(-10,20),ylim=c(-10,20),
+     cex=0.3-credit_ordered$Class/8,
+     col=3-credit_ordered$Class)
+arrows(0,0, pca$rotation[,"PC1"]*22,pca$rotation[,"PC2"]*22,length=0.1, lwd=1,angle=20, col=1)
+text(pca$rotation[,"PC1"]*25,pca$rotation[,"PC2"]*25,rownames(pca$rotation), col=1, cex=.6)
+```
+
+From biplot we also see that it looks like fraud is separable from non-fraud. We also see that if predictor V11 is highly above average it is probably Fraud. Higher Amount in most cases means Not-Fraud.
+
+
+## Split data to train and test and apply logistic regression and support vector machine classifiers to train data, plot test results
+
+```{r, ml}
+#Split data to train and test data an 0.7:0.3 proportion
+credit_part = credit %>% sdf_partition(train = 0.7, test = 0.3)
+
+#Fit train data to logistic regression model
+lr_fit =  ml_logistic_regression(credit_part$train, Class~. ) 
+#Predict outcome on test data using model 
+lr_pred = sdf_predict(credit_part$test, lr_fit)
+#Compare predicted outcome with real from test data 
+lr_pred %>% group_by(Class, prediction) %>% tally
+
+#Predict outcome on entire dataset using model 
+lr_pred = sdf_predict(credit, lr_fit)
+#Compare predicted outcome with real 
+lr_table = lr_pred %>% group_by(Class, prediction) %>% tally
+#Print Matrix
+lr_table
+
+#Get R dataframe
+lr_mtx = lr_table %>% collect
+
+
+#Fit train data to support vector machines model
+svm_fit = ml_linear_svc(credit_part$train, Class~. )
+#Predict outcome on test data using model 
+svm_pred = sdf_predict(credit_part$test, svm_fit)
+#Compare predicted outcome with real from test data 
+svm_pred %>% group_by(Class, prediction) %>% tally
+
+#Predict outcome on entire dataset using model 
+svm_pred = sdf_predict(credit, svm_fit)
+#Compare predicted outcome with real 
+svm_table = svm_pred %>% group_by(Class, prediction) %>% tally
+#Print Matrix
+svm_table
+
+#Get R dataframe
+svm_mtx = svm_table %>% collect
+
+#Function that will convert above dataframes to vector of Error, Accuracy, Sensitivity, Specificity
+acc_vals = function(mtx) {
+  fn = mtx[mtx$Class != mtx$prediction,"n"]
+  err = (ifelse(is.na(fn[1,1]), 0,sum(fn)))/sum(mtx[,"n"])
+  
+  vals = c( err = err,
+            acc = 1-err,
+            sens = as.numeric(mtx[which(mtx$Class==1 & mtx$prediction==1),"n"]/sum(mtx[mtx$Class==1,"n"])),
+            spec = as.numeric(mtx[which(mtx$Class==0 & mtx$prediction==0),"n"]/sum(mtx[mtx$Class==0,"n"])))
+  
+  vals
+}
+
+#plot_data = cbind(lr=acc_vals(lr_mtx), svm=acc_vals(svm_mtx))
+#Plot results for both models on entire datset
+plot_data = rbind(lr=acc_vals(lr_mtx), svm=acc_vals(svm_mtx))
+bp.par = par(mfrow=c(1,4),ps=12)
+for(coln in colnames(plot_data)) {
+    boxplot(val ~ type, 
+            data = data.frame(val = 100*plot_data[,coln], 
+                              type=rownames(plot_data)), 
+            main = coln,
+            border = c("green","orange"),
+            notch = TRUE
+            )
+}
+par(bp.par)
+
+#tune_svm = spark_apply(
+#    credit1,
+#    function(e)
+#      tuneToDataFrame(
+#            e1071::tune(e1071::svm,Class~.,data=e,
+#                ranges=list(kernel=c("linear", "radial", "polynomial"), 
+#                cost=c(0.5,1,2), degree=1:3, gamma=c(0.5,1,2)))$best.parameters[1,]
+#    
+#            )
+#)
+#tuneToDataFrame=function(tune){...} - need to be implemented
+```
+
+We have good results for both model. For SVM we often have 100% accuracy, depending on sampling.
+
+'sparklyr' package also offers function 'spark_apply' that as stated "applies an R function to a Spark object", that will run R function on Spark. For instance, in our case it will be very useful to use e1071 package's function tune that will find best parameters for SVM. Unfortunately, this function is not implemented well yet, it is very slow even in parallel, also return of function(e) need to be transformed to dataframe what is not always an easy task (take a look at commented part above).
+
+## Apply the model to Spark Streaming API
+
+Now, after analising data and comparing diffrent ML algorithmes we choose best one and apply it for input from Spark Streaming API, process and predict Fraud and output results with Spark Streaming API.
+
+```{r, sparkStream}
+#Define input and output path for Streaming API
+input = "/home/centos/final_project/source"
+output = "/home/centos/final_project/source-out"
+
+#if(file.exists(input)) unlink(input, TRUE)
+#if(file.exists(output)) unlink(output, TRUE)
+
+#Read csv stream to spark dataframe 
+read_folder = stream_read_csv(sc, input) 
+
+#Predict data from stream and detect Fraud
+pred = sdf_predict(read_folder, svm_fit) %>% filter(prediction == 1)
+
+#Save fraud to output folder
+write_output = stream_write_csv(pred %>% select(V1:V28, Amount, Class, prediction), output)
+
+#Stop streaming
+stream_stop(write_output)
+```
+
+
+## Conclusion
+
+Despite highly unbalaced data we got good results by about 99% accuracy. We applied training on subset of data since we run only on one physical Machine. In practice, after adding Spark worker nodes we can run same training algorithms in larger datasets. Also, re-training of models need to be implemented.
+
+
+## YouTube URLs: 
+2min preview presentation video: https://youtu.be/2minutexxx
+15min preview presentation video: https://youtu.be/15minutexxyz
+
+
